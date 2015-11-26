@@ -1,13 +1,21 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Compatibility 2 and 3
+from __future__ import absolute_import, print_function, division, unicode_literals
+from future.utils import python_2_unicode_compatible
+from builtins import str, int, bytes, chr
+
 import re
 import struct
 import time
 import socket, select
-import Queue, threading
+import queue, threading
 from collections import namedtuple
 
-import commands
+from . import commands
 
-
+@python_2_unicode_compatible
 class ISCPMessage(object):
     """Deals with formatting and parsing data wrapped in an ISCP
     containers. The docs say:
@@ -20,30 +28,42 @@ class ISCPMessage(object):
     via a serial cable.
     """
 
-    def __init__(self, data):
-        self.data = data
+    def __init__(self, msg_bytes):
+        if hasattr(msg_bytes, "encode"):
+            msg_bytes = msg_bytes.encode("ascii")
+        self.msg_bytes = bytes(msg_bytes)
+
+    def __len__(self):
+        return len(self.msg_bytes) + 3
 
     def __str__(self):
+        return self.__bytes__().decode("ascii")
+
+    def __bytes__(self):
         # ! = start character
         # 1 = destination unit type, 1 means receiver
         # End character may be CR, LF or CR+LF, according to doc
-        return '!1%s\r' % self.data
+        return b'!1' + self.msg_bytes + b'\r'
+
+    def __getitem__(self, key):
+        return bytes(self)[key]
 
     @classmethod
-    def parse(self, data):
+    def parse(self, byte_data):
+        if hasattr(byte_data, "encode"):
+            byte_data = bytes(byte_data.encode("ascii"))
         EOF = '\x1a'
         TERMINATORS = ['\n', '\r']
-        assert data[:2] == '!1'
+        assert byte_data[:2] == b'!1', "Message does not start with '!1'"
         eof_offset = -1
         # EOF can be followed by CR/LF/CR+LF
-        if data[eof_offset] in TERMINATORS:
-          eof_offset -= 1
-          if data[eof_offset] in TERMINATORS:
+        while chr(byte_data[eof_offset]) in TERMINATORS:
             eof_offset -= 1
-        assert data[eof_offset] == EOF
-        return data[2:eof_offset]
+        assert chr(byte_data[eof_offset]) == EOF, "Message does not end with '\\x1a'"
+        return byte_data[2:eof_offset]
 
 
+@python_2_unicode_compatible
 class eISCPPacket(object):
     """For communicating over Ethernet, traditional ISCP messages are
     wrapped inside an eISCP package.
@@ -53,35 +73,40 @@ class eISCPPacket(object):
         'magic, header_size, data_size, version, reserved'))
 
     def __init__(self, iscp_message):
-        iscp_message = str(iscp_message)
+        if hasattr(iscp_message, "encode"):
+            iscp_message = iscp_message.encode("ascii")
+        
         # We attach data separately, because Python's struct module does
         # not support variable length strings,
         header = struct.pack(
             '! 4s I I b 3b',
-            'ISCP',             # magic
+            b'ISCP',            # magic
             16,                 # header size (16 bytes)
             len(iscp_message),  # data size
             0x01,               # version
             0x00, 0x00, 0x00    # reserved
         )
 
-        self._bytes = "%s%s" % (header, iscp_message)
-        # __new__, string subclass?
+        self.pkt_bytes = header + bytes(iscp_message)
+
 
     def __str__(self):
-        return self._bytes
-
+        return self.__bytes__().decode("ascii")
+        
+    def __bytes__(self):
+        return self.pkt_bytes
+        
     @classmethod
-    def parse(cls, bytes):
-        """Parse the eISCP package given by ``bytes``.
+    def parse(cls, pkt_bytes):
+        """Parse the eISCP package given by ``packet_bytes``.
         """
-        h = cls.parse_header(bytes[:16])
-        data = bytes[h.header_size:h.header_size + h.data_size]
-        assert len(data) == h.data_size
+        h = cls.parse_header(pkt_bytes[:16])
+        data = pkt_bytes[h.header_size:h.header_size + h.data_size]
+        assert len(data) == h.data_size, "Wrong data size"
         return data
 
     @classmethod
-    def parse_header(self, bytes):
+    def parse_header(self, hdr_bytes):
         """Parse the header of an eISCP package.
 
         This is useful when reading data in a streaming fashion,
@@ -89,15 +114,15 @@ class eISCPPacket(object):
         expect in the packet.
         """
         # A header is always 16 bytes in length
-        assert len(bytes) == 16
+        assert len(hdr_bytes) == 16, "Wrong header size"
 
         # Parse the header
         magic, header_size, data_size, version, reserved = \
-            struct.unpack('! 4s I I b 3s', bytes)
+            struct.unpack('! 4s I I b 3s', hdr_bytes)
 
         # Strangly, the header contains a header_size field.
-        assert magic == 'ISCP'
-        assert header_size == 16
+        assert magic == b'ISCP', "Header does not start with 'ISCP'"
+        assert header_size == 16, "Wrong header size in header"
 
         return eISCPPacket.header(
             magic, header_size, data_size, version, reserved)
@@ -107,7 +132,7 @@ def command_to_packet(command):
     """Convert an ascii command like (PVR00) to the binary data we
     need to send to the receiver.
     """
-    return str(eISCPPacket(ISCPMessage(command)))
+    return bytes(eISCPPacket(ISCPMessage(command)))
 
 
 def normalize_command(command):
@@ -180,10 +205,12 @@ def command_to_iscp(command, arguments=None, zone=None):
 
     # Find the command in our database, resolve to internal eISCP command
     group = commands.ZONE_MAPPINGS.get(zone, zone)
+
     if not zone in commands.COMMANDS:
         raise ValueError('"%s" is not a valid zone' % zone)
 
     prefix = commands.COMMAND_MAPPINGS[group].get(command, command)
+    
     if not prefix in commands.COMMANDS[group]:
         raise ValueError('"%s" is not a valid command in zone "%s"'
                 % (command, zone))
@@ -202,10 +229,10 @@ def command_to_iscp(command, arguments=None, zone=None):
         # 2. See if we can match a range or pattern
         for possible_arg in commands.VALUE_MAPPINGS[group][prefix]:
             if argument.isdigit():
-                if isinstance(possible_arg, xrange):
-                    if int(argument) in possible_arg:
+                if isinstance(possible_arg, tuple) and len(possible_arg) == 2:
+                    if int(argument) in range(*possible_arg):
                         # We need to send the format "FF", hex() gives us 0xff
-                        value = hex(int(argument))[2:].zfill(2).upper()
+                        value = "{:02X}".format(int(argument))
                     break
 
             # TODO: patterns not yet supported
@@ -213,14 +240,20 @@ def command_to_iscp(command, arguments=None, zone=None):
             raise ValueError('"%s" is not a valid argument for command '
                              '"%s" in zone "%s"' % (argument, command, zone))
 
-    return '%s%s' % (prefix, value)
+    return '{:s}{:s}'.format(prefix, value).encode("ascii")
 
 
 def iscp_to_command(iscp_message):
-    for zone, zone_cmds in commands.COMMANDS.iteritems():
+    if isinstance(iscp_message, ISCPMessage):
+        iscp_message = iscp_message.msg_bytes
+    if hasattr(iscp_message, "decode"):
+        iscp_message = iscp_message.decode("ascii")
+    
+    for zone, zone_cmds in commands.COMMANDS.items():
         # For now, ISCP commands are always three characters, which
         # makes this easy.
         command, args = iscp_message[:3], iscp_message[3:]
+
         if command in zone_cmds:
             if args in zone_cmds[command]['values']:
                 return zone_cmds[command]['name'], \
@@ -260,17 +293,21 @@ def filter_for_message(getter_func, msg):
 
 def parse_info(data):
     response = eISCPPacket.parse(data)
+    print(response)
     # Return string looks something like this:
     # !1ECNTX-NR609/60128/DX
-    info = re.match(r'''
+    info = re.match(br'''
         !
         (?P<device_category>\d)
         ECN
         (?P<model_name>[^/]*)/
         (?P<iscp_port>\d{5})/
         (?P<area_code>\w{2})/
-        (?P<identifier>.{0,12})
-    ''', response.strip(), re.VERBOSE).groupdict()
+        (?P<identifier>\w{0,12})
+    ''', response.strip(), re.VERBOSE)
+    
+    if info:
+        return info.groupdict()
     return info
 
 class eISCP(object):
@@ -283,6 +320,8 @@ class eISCP(object):
     You may want to look at the :meth:`Receiver` class instead, which
     uses a background thread.
     """
+    
+    magic_packet = bytes(eISCPPacket(b'!xECNQSTN'))
 
     @classmethod
     def discover(cls, timeout=5, clazz=None):
@@ -292,7 +331,7 @@ class eISCP(object):
         in form of a list of dicts.
         """
         onkyo_port = 60128
-        onkyo_magic = str(eISCPPacket('!xECNQSTN'))
+        onkyo_magic = cls.magic_packet
 
         # Broadcast magic
         sock = socket.socket(
@@ -323,17 +362,13 @@ class eISCP(object):
     def __init__(self, host, port=60128):
         self.host = host
         self.port = port
-        self._info = None
+        self._info = {}
 
         self.command_socket = None
 
     def __repr__(self):
-        if self.info and self.info.get('model_name'):
-            model = self.info['model_name']
-        else:
-            model = 'unknown'
         string = "<%s(%s) %s:%s>" % (
-            self.__class__.__name__, model, self.host, self.port)
+            self.__class__.__name__, self.info.get('model_name', 'unknown'), self.host, self.port)
         return string
 
     @property
@@ -343,7 +378,8 @@ class eISCP(object):
                 socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setblocking(0)
             sock.bind(('0.0.0.0', 0))
-            sock.sendto(str(eISCPPacket('!xECNQSTN')), (self.host, self.port))
+            #sock.sendto(str(eISCPPacket('!xECNQSTN')), (self.host, self.port))
+            sock.sendto(self.magic_packet, (self.host, self.port))
 
             ready = select.select([sock], [], [], 0.1)
             if ready[0]:
@@ -384,7 +420,7 @@ class eISCP(object):
         or use :meth:`raw` to send a message and waiting for one.
         """
         self._ensure_socket_connected()
-        self.command_socket.send(command_to_packet(iscp_message))
+        self.command_socket.send(command_to_packet(bytes(iscp_message)))
 
     def get(self, timeout=0.1):
         """Return the next message sent by the receiver, or, after
@@ -419,8 +455,8 @@ class eISCP(object):
             # they are lost. This is so that we can find the real
             # response to our sent command later.
             pass
-        self.send(iscp_message)
-        return filter_for_message(self.get, iscp_message)
+        self.send(bytes(iscp_message))
+        return filter_for_message(self.get, bytes(iscp_message))
 
     def command(self, command, arguments=None, zone=None):
         """Send a high-level command to the receiver, return the
@@ -465,7 +501,7 @@ class Receiver(eISCP):
     def _ensure_thread_running(self):
         if not getattr(self, '_thread', False):
             self._stop = False
-            self._queue = Queue.Queue()
+            self._queue = queue.Queue()
             self._thread = threading.Thread(target=self._thread_loop)
             self._thread.start()
 
@@ -479,7 +515,7 @@ class Receiver(eISCP):
         background thread.
         """
         self._ensure_thread_running()
-        self._queue.put((iscp_message, None, None))
+        self._queue.put((bytes(iscp_message), None, None))
 
     def get(self, *a, **kw):
         """Not supported by this class. Use the :attr:`on_message``
@@ -517,11 +553,11 @@ class Receiver(eISCP):
                 # Send next message
                 try:
                     item = self._queue.get(timeout=0.01)
-                except Queue.Empty:
+                except queue.Empty:
                     continue
                 if item:
                     message, event, result = item
-                    eISCP.send(self, message)
+                    eISCP.send(self, bytes(message))
 
                     # Wait for a response, if the caller so desires
                     if event:
@@ -533,7 +569,7 @@ class Receiver(eISCP):
                             # to get() them. Maybe use a queue after all.
                             response = filter_for_message(
                                 super(Receiver, self).get, message)
-                        except ValueError, e:
+                        except ValueError as e:
                             # No response received within timeout
                             result.append(e)
                         else:
